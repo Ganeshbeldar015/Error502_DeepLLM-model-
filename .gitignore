@@ -1,0 +1,28 @@
+# Datasets
+data/
+
+# Model Checkpoints (Heavy files)
+*.pth
+*.onnx
+
+# Python Cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Visualization & Results (Keep your repo clean)
+visualize_results.png
+confusion_matrix.png
+figures/
+
+# Environments
+env/
+venv/
+.env
+.venv
+conda_env/
+
+# IDE settings
+.vscode/
+.idea/
+.DS_Store
