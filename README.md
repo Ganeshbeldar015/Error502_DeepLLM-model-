@@ -37,6 +37,15 @@ An image segmentation model built using **DeepLabV3+ with a ResNet-50 backbone**
    pip install -r requirements.txt
    ```
 
+## 🧠 Pre-trained Weights
+Since the model weight file (`model.pth`) exceeds GitHub's file size limit, you can download it from the following link:
+
+- **[Download model.pth from Google Drive](https://drive.google.com/drive/folders/1Egu0b5s2mUz-k83aPR1a8ib3d5Dxe-5i?usp=sharing)**
+
+> [!IMPORTANT]
+> To run the evaluation or visualization scripts successfully, please **manually download `model.pth` and place it in the following directory:**
+> `offroad_segmentation/model.pth`
+
 ## 🚦 How to Run
 ### 1. Training
 Start the training loop (now includes auto-saving after every epoch):

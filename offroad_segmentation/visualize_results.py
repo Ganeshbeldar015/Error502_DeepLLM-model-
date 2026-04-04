@@ -2,7 +2,7 @@ import torch
 import cv2
 import matplotlib.pyplot as plt
 import numpy as np
-from torchvision import models
+from torchvision import models, transforms
 from dataset import SegmentationDataset
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
