@@ -6,68 +6,116 @@ from torchvision.models.segmentation import DeepLabV3_ResNet50_Weights
 from dataset import SegmentationDataset
 from tqdm import tqdm
 from utils import compute_iou
+import yaml
+import os
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+def load_config():
+    config_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.yaml")
+    with open(config_path, "r") as f:
+        return yaml.safe_load(f)
 
 def main():
-    # 🔥 FAST MODE (limit dataset for now)
-    train_dataset = SegmentationDataset("../data/train/images", "../data/train/masks", split="train")
-    val_dataset = SegmentationDataset("../data/val/images", "../data/val/masks", split="val")
+    config = load_config()
+    
+    # Determine device
+    if config["training"]["device"] == "auto":
+        DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+    else:
+        DEVICE = config["training"]["device"]
+
+    # Load datasets
+    limit = config["training"].get("limit_dataset", None)
+    train_dataset = SegmentationDataset(
+        config["data"]["train"]["images"], 
+        config["data"]["train"]["masks"], 
+        split="train",
+        limit=limit
+    )
+    val_dataset = SegmentationDataset(
+        config["data"]["val"]["images"], 
+        config["data"]["val"]["masks"], 
+        split="val",
+        limit=limit
+    )
 
     train_loader = DataLoader(
         train_dataset,
-        batch_size=2,              # 📉 Reduced batch size (OOM prevention)
+        batch_size=config["training"]["batch_size"],
         shuffle=True,
-        num_workers=4,            # 🔥 faster loading
-        pin_memory=True,
-        drop_last=True             # ✅ FIX: Avoids BatchNorm error on last batch
+        num_workers=config["dataloader"]["num_workers"],
+        pin_memory=config["dataloader"]["pin_memory"],
+        persistent_workers=config["dataloader"]["persistent_workers"],
+        drop_last=config["dataloader"]["drop_last"]
     )
 
     val_loader = DataLoader(
         val_dataset,
-        batch_size=2,              # 📉 Reduced batch size
-        num_workers=4,
-        pin_memory=True
+        batch_size=config["training"]["batch_size"],
+        num_workers=config["dataloader"]["num_workers"],
+        pin_memory=config["dataloader"]["pin_memory"],
+        persistent_workers=config["dataloader"]["persistent_workers"]
     )
 
-    # 🔥 Pretrained model
+    # Load model
     model = models.segmentation.deeplabv3_resnet50(
-        weights=DeepLabV3_ResNet50_Weights.DEFAULT
+        weights=DeepLabV3_ResNet50_Weights.DEFAULT if config["model"]["pretrained"] else None
     )
-    model.classifier[4] = nn.Conv2d(256, 10, kernel_size=1)
-
+    model.classifier[4] = nn.Conv2d(256, config["training"]["num_classes"], kernel_size=1)
     model.to(DEVICE)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4) # Start with 1e-4
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=2)
-    loss_fn = nn.CrossEntropyLoss()
-    scaler = torch.amp.GradScaler('cuda') # ✅ Added GradScaler for AMP (Mixed Precision)
+    # Optimizer and scheduler
+    if config["optimizer"]["type"] == "Adam":
+        optimizer = torch.optim.Adam(model.parameters(), lr=config["training"]["learning_rate"])
+    
+    if config["optimizer"]["lr_scheduler"] == "ReduceLROnPlateau":
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, 
+            mode='max', 
+            factor=config["optimizer"]["scheduler_factor"], 
+            patience=config["optimizer"]["scheduler_patience"]
+        )
 
-    # Initialize tracking variables for IoU monitoring
+    # Loss function
+    if config["loss"]["type"] == "CrossEntropyLoss":
+        loss_fn = nn.CrossEntropyLoss()
+    
+    # Only use GradScaler if CUDA is available
+    scaler = None
+    if DEVICE == "cuda":
+        scaler = torch.amp.GradScaler('cuda')
+
+    # Initialize tracking variables
     running_iou = 0.0
     successful_epochs = 0
 
-    for epoch in range(30):   # Target: 0.45+ IoU
+    for epoch in range(config["training"]["epochs"]):
         model.train()
         loop = tqdm(train_loader)
 
         for imgs, masks in loop:
             imgs = imgs.to(DEVICE, non_blocking=True)
-            masks = masks.to(DEVICE, non_blocking=True).long() # ensure long for cross entropy
+            masks = masks.to(DEVICE, non_blocking=True).long()
 
-            # ✅ Mixed Precision Training (saves memory)
-            with torch.amp.autocast('cuda'):
+            if DEVICE == "cuda":
+                with torch.amp.autocast('cuda'):
+                    outputs = model(imgs)['out']
+                    loss = loss_fn(outputs, masks)
+
+                optimizer.zero_grad()
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
                 outputs = model(imgs)['out']
                 loss = loss_fn(outputs, masks)
 
-            optimizer.zero_grad()
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
 
             loop.set_postfix(loss=loss.item())
 
-        # ✅ VALIDATION
+        # Validation
         model.eval()
         ious = []
 
@@ -77,22 +125,19 @@ def main():
                 masks = masks.to(DEVICE, non_blocking=True)
 
                 outputs = model(imgs)['out']
-                iou = compute_iou(outputs, masks).item() # ✅ Keep it on CPU
+                iou = compute_iou(outputs, masks, num_classes=config["training"]["num_classes"]).item()
                 ious.append(iou)
 
         avg_iou = sum(ious) / len(ious)
 
-        # Update running average IoU only for successful epochs (IoU > 0)
         if avg_iou > 0:
             running_iou = (running_iou * successful_epochs + avg_iou) / (successful_epochs + 1)
             successful_epochs += 1
 
         print(f"\nEpoch {epoch} done | IoU: {avg_iou:.4f} | Running Avg IoU: {running_iou:.4f} | LR: {optimizer.param_groups[0]['lr']:.6f}")
 
-        # ✅ Adjust learning rate based on performance
         scheduler.step(avg_iou)
 
-        # ✅ SAVE MODEL EVERY EPOCH
         torch.save(model.state_dict(), "model.pth")
         print(f"Model saved to model.pth (Epoch {epoch})")
 

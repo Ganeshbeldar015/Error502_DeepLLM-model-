@@ -4,19 +4,37 @@ import matplotlib.pyplot as plt
 import numpy as np
 from torchvision import models, transforms
 from dataset import SegmentationDataset
+import yaml
+import os
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+def load_config():
+    config_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.yaml")
+    with open(config_path, "r") as f:
+        return yaml.safe_load(f)
 
-def visualize_results(num_images=5):
+def visualize_results():
+    config = load_config()
+    
+    # Determine device
+    if config["training"]["device"] == "auto":
+        DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+    else:
+        DEVICE = config["training"]["device"]
+    
+    num_images = config["visualization"]["num_images"]
+
     # Load dataset
-    val_dataset = SegmentationDataset("../data/val/images", "../data/val/masks", split="val")
+    val_dataset = SegmentationDataset(
+        config["data"]["val"]["images"], 
+        config["data"]["val"]["masks"], 
+        split="val"
+    )
     
     # Load model architecture
     model = models.segmentation.deeplabv3_resnet50(weights=None)
-    model.classifier[4] = torch.nn.Conv2d(256, 10, kernel_size=1)
+    model.classifier[4] = torch.nn.Conv2d(256, config["training"]["num_classes"], kernel_size=1)
     
     # Load trained weights
-    # ✅ Fix: Use strict=False to ignore training-only auxiliary classifier keys
     model.load_state_dict(torch.load("model.pth", map_location=DEVICE), strict=False)
     model.to(DEVICE)
     model.eval()
@@ -35,13 +53,13 @@ def visualize_results(num_images=5):
             output = model(input_tensor)['out']
             preds = torch.argmax(output, dim=1).squeeze(0).cpu().numpy()
 
-        # ✅ Un-normalize image for display (otherwise it will look very dark/strange)
+        # Un-normalize image for display
         inv_normalize = transforms.Normalize(
             mean=[-0.485/0.229, -0.456/0.224, -0.406/0.225],
             std=[1/0.229, 1/0.224, 1/0.225]
         )
         img_display = inv_normalize(img).permute(1, 2, 0).cpu().numpy()
-        img_display = np.clip(img_display, 0, 1) # Ensure values are in valid range [0, 1]
+        img_display = np.clip(img_display, 0, 1)
         mask_display = mask.cpu().numpy()
 
         # Plot Original

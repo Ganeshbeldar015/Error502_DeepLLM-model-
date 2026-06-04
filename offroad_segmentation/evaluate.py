@@ -7,17 +7,39 @@ from tqdm import tqdm
 import numpy as np
 import matplotlib.pyplot as plt
 from torchmetrics.classification import MulticlassAveragePrecision
+import yaml
+import os
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+def load_config():
+    config_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.yaml")
+    with open(config_path, "r") as f:
+        return yaml.safe_load(f)
 
 def main():
-    val_dataset = SegmentationDataset("../data/val/images", "../data/val/masks", split="val")
-    val_loader = DataLoader(val_dataset, batch_size=4, num_workers=2)
+    config = load_config()
+    
+    # Determine device
+    if config["training"]["device"] == "auto":
+        DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+    else:
+        DEVICE = config["training"]["device"]
+
+    val_dataset = SegmentationDataset(
+        config["data"]["val"]["images"], 
+        config["data"]["val"]["masks"], 
+        split="val"
+    )
+    val_loader = DataLoader(
+        val_dataset, 
+        batch_size=config["evaluation"]["batch_size"], 
+        num_workers=config["evaluation"]["num_workers"],
+        pin_memory=True,
+        persistent_workers=True
+    )
 
     model = models.segmentation.deeplabv3_resnet50(weights=None)
-    model.classifier[4] = torch.nn.Conv2d(256, 10, kernel_size=1)
+    model.classifier[4] = torch.nn.Conv2d(256, config["training"]["num_classes"], kernel_size=1)
 
-    # ✅ Fix: Use strict=False to ignore training-only auxiliary classifier keys
     try:
         model.load_state_dict(torch.load("model.pth", map_location=DEVICE), strict=False)
         print("✓ Loaded model.pth")
@@ -28,10 +50,9 @@ def main():
     model.to(DEVICE)
     model.eval()
 
-    ious = []
-    conf_matrix = torch.zeros(10, 10, dtype=torch.int64)
-    # ✅ Fix: Calculate mAP on CPU to save VRAM
-    mAP_metric = MulticlassAveragePrecision(num_classes=10, average='macro').to('cpu')
+    num_classes = config["training"]["num_classes"]
+    conf_matrix = torch.zeros(num_classes, num_classes, dtype=torch.int64)
+    mAP_metric = MulticlassAveragePrecision(num_classes=num_classes, average='macro').to('cpu')
 
     print(f"Evaluating on {DEVICE}...")
     with torch.no_grad():
@@ -42,30 +63,49 @@ def main():
             outputs = model(imgs)['out']
             preds = torch.argmax(outputs, dim=1)
 
-            # ✅ Update mAP (Calculate on CPU to avoid Out of Memory)
-            mAP_metric.update(outputs.cpu(), masks.cpu())
+            if config["evaluation"]["downsample_for_map"]:
+                downsample_size = tuple(config["evaluation"]["downsample_size"])
+                outputs_small = torch.nn.functional.interpolate(
+                    outputs, 
+                    size=downsample_size, 
+                    mode='bilinear', 
+                    align_corners=False
+                )
+                masks_small = torch.nn.functional.interpolate(
+                    masks.unsqueeze(1).float(), 
+                    size=downsample_size, 
+                    mode='nearest'
+                ).squeeze(1).long()
+                mAP_metric.update(outputs_small.cpu(), masks_small.cpu())
+            else:
+                mAP_metric.update(outputs.cpu(), masks.cpu())
 
-            # ✅ Fast Vectorized Confusion Matrix Update
-            indices = 10 * masks.view(-1) + preds.view(-1)
-            conf_matrix += torch.bincount(indices, minlength=100).reshape(10, 10).cpu()
+            indices = num_classes * masks.view(-1) + preds.view(-1)
+            conf_matrix += torch.bincount(indices, minlength=num_classes*num_classes).reshape(num_classes, num_classes).cpu()
 
-            iou = compute_iou(outputs, masks).item()
-            ious.append(iou)
-
-    if ious:
-        avg_iou = sum(ious) / len(ious)
-        final_mAP = mAP_metric.compute().item()
-        print(f"\nFinal Validation IoU: {avg_iou:.4f}")
-        print(f"Final Validation mAP: {final_mAP:.4f}")
+    if conf_matrix.sum() > 0:
+        print("\nCalculating final metrics...")
+        tp = torch.diag(conf_matrix)
+        fp = torch.sum(conf_matrix, dim=0) - tp
+        fn = torch.sum(conf_matrix, dim=1) - tp
+        union = tp + fp + fn
+        ious_per_class = tp / (union + 1e-6)
+        avg_iou = ious_per_class.mean().item()
         
-        # ✅ Save Heatmap
-        save_confusion_matrix(conf_matrix)
+        final_mAP = mAP_metric.compute().item()
+        
+        pixel_accuracy = (torch.diag(conf_matrix).sum() / conf_matrix.sum()).item()
+        
+        print(f"Final Validation IoU: {avg_iou:.4f}")
+        print(f"Final Validation mAP: {final_mAP:.4f}")
+        print(f"Final Pixel Accuracy: {pixel_accuracy:.4f}")
+        
+        save_confusion_matrix(conf_matrix, num_classes)
     else:
         print("\nNo validation data found.")
 
-def save_confusion_matrix(cm):
+def save_confusion_matrix(cm, num_classes):
     cm = cm.cpu().numpy()
-    # Normalize by row (true class proportions)
     cm_norm = cm.astype('float') / (cm.sum(axis=1)[:, np.newaxis] + 1e-6)
 
     plt.figure(figsize=(10, 8))
@@ -75,9 +115,8 @@ def save_confusion_matrix(cm):
     plt.xlabel('Predicted Class')
     plt.ylabel('True Class')
 
-    # Add text annotations
-    for i in range(10):
-        for j in range(10):
+    for i in range(num_classes):
+        for j in range(num_classes):
             plt.text(j, i, f"{cm_norm[i, j]:.2f}", 
                      ha="center", va="center", color="black" if cm_norm[i,j] < 0.5 else "white")
 

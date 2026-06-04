@@ -6,3 +6,4 @@ opencv-python
 tqdm
 torchmetrics>=0.10.0
 pillow
+pyyaml

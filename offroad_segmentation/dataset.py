@@ -23,6 +23,14 @@ class SegmentationDataset(Dataset):
             std=[0.229, 0.224, 0.225]
         )
 
+        # ✨ NEW: Robust Color Augmentation (helps with Real-World textures)
+        self.color_aug = transforms.Compose([
+            transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2, hue=0.1),
+            transforms.RandomGrayscale(p=0.1),
+            # Optional: Add small blur to handle low-quality real-world images
+            transforms.GaussianBlur(kernel_size=(3, 3), sigma=(0.1, 2.0))
+        ])
+
     def __len__(self):
         return len(self.images)
 
@@ -50,6 +58,10 @@ class SegmentationDataset(Dataset):
         # Convert to tensor & scale to [0, 1]
         image = torch.tensor(image).permute(2, 0, 1).float() / 255.0
         
+        # ✨ NEW: Apply color augmentation only during training
+        if self.split == "train":
+            image = self.color_aug(image)
+
         # Normalize image (IMPORTANT: must happen after /255.0 and before training)
         image = self.normalize(image)
 
